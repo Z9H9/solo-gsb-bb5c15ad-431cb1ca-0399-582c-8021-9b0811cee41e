@@ -103,6 +103,82 @@ class PackageIn(BaseModel):
         return value
 
 
+# ---------- 注册表变更预演 ----------
+
+
+class RegistryPreviewIn(BaseModel):
+    """注册表变更预演请求：该包待写入的版本列表（与 PUT 同构）+ 一份插件清单。"""
+
+    versions: List[PackageVersionIn] = Field(
+        ...,
+        min_length=1,
+        description="该包待写入的版本及依赖，语义与 PUT /api/v1/registry/packages/{name} 一致：逐版本覆盖、其他版本保留",
+    )
+    manifest: ManifestIn = Field(..., description="分别在当前注册表与预演注册表上求解的插件清单")
+
+
+class RegistryPreviewSideOut(BaseModel):
+    """单侧（当前 / 预演）求解结果：状态与可行时的版本解等审计字段。"""
+
+    status: Literal["feasible", "infeasible", "inconclusive"]
+    resolution: Optional[Dict[str, str]] = Field(
+        None, description="可行版本解（包名 -> 具体版本）；非 feasible 时为 null"
+    )
+    explanation: str
+    node_count: int
+    conflicts: List[ConflictOut] = Field(
+        default_factory=list, description="infeasible 时的全部最小冲突链；其余状态为空列表"
+    )
+
+
+class RegistryPreviewVersionChangeOut(BaseModel):
+    """某个包的选中版本变化。"""
+
+    package: str
+    before: Optional[str] = Field(None, description="当前解中的版本；新增包为 null")
+    after: Optional[str] = Field(None, description="预演解中的版本；移除包为 null")
+    change: Literal["added", "removed", "changed", "unchanged"] = Field(
+        ...,
+        description=(
+            "added=仅预演解中出现；removed=仅当前解中出现；"
+            "changed=两侧都有但版本不同；unchanged=两侧版本相同"
+        ),
+    )
+
+
+class RegistryPreviewChangesOut(BaseModel):
+    """当前 -> 预演的变化对比；任一侧 inconclusive 时整个对象为 null（不推断变化结论）。"""
+
+    status_changed: bool = Field(..., description="两侧求解状态是否发生变化")
+    version_changes: List[RegistryPreviewVersionChangeOut] = Field(
+        ..., description="两侧可行解中每个包的选中版本变化，按包名升序"
+    )
+    added: List[str] = Field(..., description="仅在预演解中被选中的包，按包名升序")
+    removed: List[str] = Field(..., description="仅在当前解中被选中的包，按包名升序")
+    changed: List[str] = Field(..., description="两侧都被选中但版本不同的包，按包名升序")
+    unchanged: List[str] = Field(..., description="两侧选中版本相同的包，按包名升序")
+
+
+class RegistryPreviewResponse(BaseModel):
+    """POST /api/v1/registry/packages/{name}/preview：注册表变更预演结果（只读，不写库）。"""
+
+    package: str = Field(..., description="预演变更的目标包名（路径参数）")
+    versions: List[str] = Field(
+        ..., description="待写入（逐版本覆盖）的版本号列表，顺序与请求一致"
+    )
+    current: RegistryPreviewSideOut = Field(..., description="在当前注册表上求解清单的结果")
+    preview: RegistryPreviewSideOut = Field(
+        ..., description="在内存预演注册表（应用待写入版本后）上求解清单的结果"
+    )
+    changes: Optional[RegistryPreviewChangesOut] = Field(
+        None,
+        description=(
+            "状态与选中版本的变化；当前或预演任一侧 inconclusive（搜索预算耗尽）时为 null，"
+            "此时不推断任何变化结论"
+        ),
+    )
+
+
 # ---------- 注册表循环依赖诊断 ----------
 
 

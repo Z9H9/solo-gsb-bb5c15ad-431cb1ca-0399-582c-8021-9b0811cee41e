@@ -67,6 +67,11 @@ from .models import (
     ManifestIn,
     PackageIn,
     RegistryCyclesResponse,
+    RegistryPreviewChangesOut,
+    RegistryPreviewIn,
+    RegistryPreviewResponse,
+    RegistryPreviewSideOut,
+    RegistryPreviewVersionChangeOut,
 )
 from .semver import Version, VersionError
 from .solver import Solver
@@ -139,6 +144,7 @@ def index() -> dict:
             "GET /api/v1/audit-jobs/{job_id}",
             "DELETE /api/v1/audit-jobs/{job_id}/items/{item_index}",
             "GET /api/v1/registry/cycles",
+            "POST /api/v1/registry/packages/{name}/preview",
             "PUT /api/v1/registry/packages/{name}",
             "GET /api/v1/registry/packages",
         ],
@@ -843,6 +849,120 @@ def put_package(name: str, payload: PackageIn, request: Request) -> dict:
         "versions": [v.version for v in payload.versions],
         "stored": len(payload.versions),
     }
+
+
+def _validate_package_path_name(name: str) -> str:
+    """路径参数包名校验，规则与 PackageIn.name 一致；非法返回 422。"""
+    cleaned = name.strip()
+    if not cleaned or any(ch.isspace() for ch in cleaned):
+        raise HTTPException(status_code=422, detail="包名非法")
+    return cleaned
+
+
+def _build_preview_registry(
+    registry: dict, name: str, versions: list
+) -> dict:
+    """在内存中应用 PUT 语义：同版本覆盖依赖，包内其他版本与其他包原样保留。"""
+    preview = {pkg: {ver: dict(deps) for ver, deps in versions_map.items()}
+               for pkg, versions_map in registry.items()}
+    package_versions = dict(preview.get(name, {}))
+    for item in versions:
+        package_versions[item.version] = dict(item.dependencies)
+    preview[name] = package_versions
+    return preview
+
+
+def _resolution_changes(
+    current_result: Any, preview_result: Any
+) -> Optional[RegistryPreviewChangesOut]:
+    """对比两侧可行解的状态与选中版本；任一侧 inconclusive 时返回 None。"""
+    if current_result.status == "inconclusive" or preview_result.status == "inconclusive":
+        return None
+
+    current_resolution = current_result.resolution or {}
+    preview_resolution = preview_result.resolution or {}
+    version_changes: list[RegistryPreviewVersionChangeOut] = []
+    for pkg in sorted(set(current_resolution) | set(preview_resolution)):
+        before = current_resolution.get(pkg)
+        after = preview_resolution.get(pkg)
+        if before is None:
+            change = "added"
+        elif after is None:
+            change = "removed"
+        elif before != after:
+            change = "changed"
+        else:
+            change = "unchanged"
+        version_changes.append(
+            RegistryPreviewVersionChangeOut(
+                package=pkg, before=before, after=after, change=change
+            )
+        )
+
+    buckets: dict[str, list[str]] = {
+        kind: [vc.package for vc in version_changes if vc.change == kind]
+        for kind in ("added", "removed", "changed", "unchanged")
+    }
+    return RegistryPreviewChangesOut(
+        status_changed=current_result.status != preview_result.status,
+        version_changes=version_changes,
+        added=buckets["added"],
+        removed=buckets["removed"],
+        changed=buckets["changed"],
+        unchanged=buckets["unchanged"],
+    )
+
+
+@app.post(
+    "/api/v1/registry/packages/{name}/preview",
+    response_model=RegistryPreviewResponse,
+    tags=["registry"],
+    summary="注册表变更预演：按 PUT 逐版本覆盖语义在内存构造预演注册表，同清单求解两侧并对比",
+)
+def preview_package(name: str, payload: RegistryPreviewIn, request: Request) -> RegistryPreviewResponse:
+    """纯只读预演，**不写入注册表，也不产生任何审计记录**。
+
+    * 待写入版本与 PUT ``/api/v1/registry/packages/{name}`` 同构：包内逐版本覆盖
+      （同版本覆盖依赖），未出现在请求中的其他版本原样保留，其他包完全不变；
+    * 同一份清单分别在**当前注册表**与内存中的**预演注册表**上求解，
+      返回两侧状态、可行时的版本解（``resolution``/``explanation``/``node_count``，
+      无解时附带最小冲突链），以及状态与选中版本的变化；
+    * 任一侧搜索预算耗尽（``inconclusive``）时 ``changes`` 为 ``null``，
+      不推断状态或版本的变化结论；
+    * 版本列表、依赖范围与清单校验复用现有模型，非法输入返回 ``422``；
+      根插件版本在当前注册表（因而也在预演注册表——预演只增改不删）中不存在时同样返回 ``422``。
+    """
+    name = _validate_package_path_name(name)
+    conn = get_conn(request)
+    current_registry = load_registry(conn)
+    preview_registry = _build_preview_registry(current_registry, name, payload.versions)
+
+    try:
+        current_result, _, _ = _solve_manifest(payload.manifest, current_registry)
+        preview_result, _, _ = _solve_manifest(payload.manifest, preview_registry)
+    except (_RootPluginNotFound, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    changes = _resolution_changes(current_result, preview_result)
+    return RegistryPreviewResponse(
+        package=name,
+        versions=[v.version for v in payload.versions],
+        current=RegistryPreviewSideOut(
+            status=current_result.status,
+            resolution=current_result.resolution,
+            explanation=current_result.explanation,
+            node_count=current_result.node_count,
+            conflicts=current_result.conflicts,
+        ),
+        preview=RegistryPreviewSideOut(
+            status=preview_result.status,
+            resolution=preview_result.resolution,
+            explanation=preview_result.explanation,
+            node_count=preview_result.node_count,
+            conflicts=preview_result.conflicts,
+        ),
+        changes=changes,
+    )
 
 
 @app.get("/api/v1/registry/packages", response_model=dict, tags=["registry"])

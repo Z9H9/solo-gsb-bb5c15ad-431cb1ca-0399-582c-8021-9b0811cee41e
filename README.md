@@ -11,6 +11,9 @@
   可轮询作业状态/计数/逐项结果，可取消尚未开始的条目，服务重启后依据 SQLite 状态自动恢复；
 - 提供**只读注册表循环依赖诊断**：把每个已登记包版本按其依赖范围连线构图，
   用强连通分量找出循环（含自依赖），返回涉及的包版本与依赖边，不写入审计或注册表；
+- 提供**注册表变更预演**：按 PUT 逐版本覆盖、其他版本保留的语义在内存构造预演注册表，
+  分别用当前与预演注册表求解同一份清单，返回两侧状态、可行版本解及变化对比，
+  不写入注册表或审计记录；
 - 自带健康检查、OpenAPI 文档、示例注册表与一键 Docker Compose 启动。
 
 ## 一条命令启动
@@ -610,6 +613,80 @@ curl -s http://localhost:8000/api/v1/registry/cycles | jq
   （数值序，如 `1.2.0` < `1.10.0`）升序，重复调用输出字节一致；
 - 仅 `GET`（其他方法返回 `405`），始终 `200`，无任何参数；空注册表也返回空列表。
 
+### 10. 注册表变更预演（只读，不写库）
+
+写入注册表前先评估影响：`POST /api/v1/registry/packages/{name}/preview` 接收该包
+**待写入的版本列表**（与 PUT 请求体中的 `versions` 同构）和**一份插件清单**，
+服务按 `PUT /api/v1/registry/packages/{name}` 完全一致的语义——**包内逐版本覆盖**
+（同版本覆盖其依赖）、未列出的其他版本与其他包原样保留——在内存中构造预演注册表，
+然后分别用**当前注册表**与**预演注册表**求解同一份清单，返回两侧结果与变化对比。
+整个过程**不写入注册表，也不产生任何审计记录**，重复调用结果一致。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/registry/packages/core-lib/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "versions": [
+      {"version": "1.6.0", "dependencies": {}}
+    ],
+    "manifest": {
+      "dependencies": [{"name": "cachekit", "range": "~1.3.0"}]
+    }
+  }' | jq
+```
+
+返回（节选）：
+
+```json
+{
+  "package": "core-lib",
+  "versions": ["1.6.0"],
+  "current": {
+    "status": "feasible",
+    "resolution": {"cachekit": "1.3.0", "core-lib": "1.5.0"},
+    "explanation": "找到可行版本组合，共 2 个包",
+    "node_count": 2,
+    "conflicts": []
+  },
+  "preview": {
+    "status": "feasible",
+    "resolution": {"cachekit": "1.3.0", "core-lib": "1.6.0"},
+    "explanation": "找到可行版本组合，共 2 个包",
+    "node_count": 2,
+    "conflicts": []
+  },
+  "changes": {
+    "status_changed": false,
+    "version_changes": [
+      {"package": "cachekit", "before": "1.3.0", "after": "1.3.0", "change": "unchanged"},
+      {"package": "core-lib", "before": "1.5.0", "after": "1.6.0", "change": "changed"}
+    ],
+    "added": [],
+    "removed": [],
+    "changed": ["core-lib"],
+    "unchanged": ["cachekit"]
+  }
+}
+```
+
+要点：
+
+- **`current` / `preview`**：两侧各自给出 `status`、可行时的 `resolution`（版本解）、
+  `explanation`、`node_count`；状态为 `infeasible` 时 `resolution` 为 `null` 并携带
+  与审计接口同构的 `conflicts`（全部最小冲突链）；
+- **`changes`**：`status_changed` 表示两侧状态是否变化；`version_changes` 按包名升序列出
+  每个包的 `before` / `after` 选中版本与变化类型（`added` 仅预演解出现、
+  `removed` 仅当前解出现、`changed` 版本不同、`unchanged` 相同），并附
+  `added` / `removed` / `changed` / `unchanged` 四个包名列表；
+- **预算耗尽不推断变化**：任一侧 `status` 为 `inconclusive`（搜索节点超过预算）时
+  `changes` 为 `null`，两侧状态与 `node_count` 照常返回，但不会给出任何变化结论；
+- **PUT 语义**：待写入版本与同包已有版本按版本号合并（同版本覆盖依赖），未列出的版本保留；
+  预演中的包即使当前不存在也可（当前侧对其依赖会得到 `package_missing`）；
+- **422 场景**：复用现有版本与清单校验——非法 SemVer 版本 / 依赖范围、空版本列表、
+  清单非法范围、`plugin_name` 与 `plugin_version` 只提供其一，或根插件版本在两侧注册表
+  均不存在时返回 `422`；
+- 路径非法包名（空白等）返回 `422`；预演为纯只读操作，注册表与审计表均不发生变化。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -627,6 +704,7 @@ curl -s http://localhost:8000/api/v1/registry/cycles | jq
 | `POST` | `/api/v1/audits/export-bundle` | 把已有审计结果打包为确定性、可验证的 JSONL 导出包（只读，不写库） |
 | `POST` | `/api/v1/audits/verify-bundle` | 校验导出包：manifest、记录顺序、逐条摘要、整体摘要（不写库） |
 | `GET`  | `/api/v1/registry/cycles` | 只读循环依赖诊断：包版本按依赖范围连线构图，返回含环强连通分量（含自依赖）的节点与边；无循环返回空列表 |
+| `POST` | `/api/v1/registry/packages/{name}/preview` | 注册表变更预演：按 PUT 逐版本覆盖语义在内存构造预演注册表，分别用当前/预演注册表求解清单，返回两侧状态、版本解与变化（只读不写库；任一侧预算耗尽时 `changes=null`；非法输入 `422`） |
 | `GET`  | `/api/v1/registry/packages` | 查看注册表全部包与版本 |
 | `PUT`  | `/api/v1/registry/packages/{name}` | 新增/覆盖一个包及其版本依赖 |
 
@@ -685,6 +763,9 @@ pytest -q
 时间格式与区间非法返回 422、不被 /{id} 路由遮蔽），
 注册表循环依赖诊断（空注册表/有向无环图返回空列表、自依赖自环按范围是否满足报告、
 多包环的节点与分量内边、范围一对多展开、SemVer 数值序稳定排序、只读不产生审计/注册表写入），
+注册表变更预演（PUT 逐版本覆盖与其他版本保留语义、两侧状态与版本解对比、
+feasible/infeasible 翻转的 added/removed 结论、任一侧预算耗尽保留 inconclusive 且 changes=null、
+非法版本/清单/根插件缺失返回 422、不写入注册表与审计记录、重复调用结果一致），
 以及导出包的确定性、重复/未知 ID 错误码与逐字节/顺序篡改识别。
 
 ## 项目结构
