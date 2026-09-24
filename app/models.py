@@ -103,6 +103,99 @@ class PackageIn(BaseModel):
         return value
 
 
+# ---------- 注册表变更预演 ----------
+
+
+class PackagePreviewIn(PackageIn):
+    """预演请求：待写入的包版本列表 + 一份待求解的插件清单。
+
+    字段形态与 PUT /api/v1/registry/packages/{name} 的请求体一致，额外携带
+    ``manifest``；``name`` / ``versions`` 与 ``manifest`` 复用写入接口与
+    审计接口的既有校验。
+    """
+
+    manifest: ManifestIn = Field(
+        ...,
+        description="分别在当前注册表与预演注册表上求解的插件清单，格式与 POST /api/v1/audits 请求体一致",
+    )
+
+
+class PreviewSideOut(BaseModel):
+    """单侧（当前/预演）注册表对清单的求解结果（仅状态与可行时的版本解）。"""
+
+    status: Literal["feasible", "infeasible", "inconclusive"] = Field(
+        ..., description="求解状态；搜索预算耗尽时为 inconclusive"
+    )
+    resolution: Optional[Dict[str, str]] = Field(
+        None, description="可行时选中的版本解（包名 -> 版本）；infeasible/inconclusive 时为 null"
+    )
+
+
+class PreviewPackageVersionChangeOut(BaseModel):
+    """目标包某个版本在预演前后的依赖变化。"""
+
+    version: str = Field(..., description="发生变化的包版本")
+    before: Optional[Dict[str, str]] = Field(
+        None, description="当前注册表中该版本的依赖（包名 -> 范围）；预演新增版本时为 null"
+    )
+    after: Dict[str, str] = Field(
+        ..., description="预演注册表中该版本的依赖（包名 -> 范围）"
+    )
+
+
+class PreviewResolutionDiffOut(BaseModel):
+    """版本解变化（按四种变化类型分区）；结论确定时即使一侧 infeasible 也给出。"""
+
+    added: Dict[str, str] = Field(
+        default_factory=dict,
+        description="仅预演解中出现的包（包名 -> 预演选中版本）",
+    )
+    removed: Dict[str, str] = Field(
+        default_factory=dict,
+        description="仅当前解中出现的包（包名 -> 当前选中版本）",
+    )
+    changed: Dict[str, str] = Field(
+        default_factory=dict,
+        description="两侧都出现但选中版本不同的包，值为预演选中版本",
+    )
+    unchanged: Dict[str, str] = Field(
+        default_factory=dict, description="两侧选中版本一致的包（包名 -> 版本）"
+    )
+
+
+class PreviewChangesOut(BaseModel):
+    """当前 -> 预演的变化：状态变化、版本解变化、目标包的版本变更。"""
+
+    status_changed: Optional[bool] = Field(
+        None,
+        description=(
+            "求解状态是否变化；任一侧 inconclusive（搜索预算耗尽、结论不可推断）时为 null"
+        ),
+    )
+    resolution: Optional[PreviewResolutionDiffOut] = Field(
+        None,
+        description=(
+            "选中版本变化（两侧均为确定结论时给出；infeasible 一侧无版本解，"
+            "另一侧的全部包计入 added/removed）；任一侧 inconclusive 时为 null"
+        ),
+    )
+    package_versions: List[PreviewPackageVersionChangeOut] = Field(
+        ..., description="目标包在预演中新增或被覆盖依赖的版本（按 SemVer 升序）"
+    )
+
+
+class RegistryPreviewResponse(BaseModel):
+    """POST /api/v1/registry/packages/{name}/preview：纯内存预演结果（不落库、不写审计）。"""
+
+    name: str = Field(..., description="预演的目标包名")
+    versions: List[str] = Field(
+        ..., description="本次请求待写入的版本列表（沿用 PUT 逐版本覆盖语义）"
+    )
+    current: PreviewSideOut = Field(..., description="清单在当前注册表上的求解结果")
+    preview: PreviewSideOut = Field(..., description="清单在预演注册表上的求解结果")
+    changes: PreviewChangesOut = Field(..., description="当前 -> 预演的状态与选中版本变化")
+
+
 # ---------- 注册表循环依赖诊断 ----------
 
 

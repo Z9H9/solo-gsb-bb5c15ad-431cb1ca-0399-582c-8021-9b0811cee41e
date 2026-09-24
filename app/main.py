@@ -66,8 +66,11 @@ from .models import (
     ImpactResponse,
     ManifestIn,
     PackageIn,
+    PackagePreviewIn,
     RegistryCyclesResponse,
+    RegistryPreviewResponse,
 )
+from .preview import build_preview_body, build_preview_registry
 from .semver import Version, VersionError
 from .solver import Solver
 from .summary import InvalidTimeBound, build_audit_summary, parse_utc_bound
@@ -140,6 +143,7 @@ def index() -> dict:
             "DELETE /api/v1/audit-jobs/{job_id}/items/{item_index}",
             "GET /api/v1/registry/cycles",
             "PUT /api/v1/registry/packages/{name}",
+            "POST /api/v1/registry/packages/{name}/preview",
             "GET /api/v1/registry/packages",
         ],
     }
@@ -843,6 +847,55 @@ def put_package(name: str, payload: PackageIn, request: Request) -> dict:
         "versions": [v.version for v in payload.versions],
         "stored": len(payload.versions),
     }
+
+
+@app.post(
+    "/api/v1/registry/packages/{name}/preview",
+    response_model=RegistryPreviewResponse,
+    tags=["registry"],
+    summary="注册表变更预演：内存构造写入后的注册表，对比同一份清单在两侧的求解结果",
+)
+def preview_package(name: str, payload: PackagePreviewIn, request: Request) -> RegistryPreviewResponse:
+    """纯内存预演一次包写入对清单求解的影响，**不写入注册表，也不写审计记录**。
+
+    * 沿用 ``PUT /api/v1/registry/packages/{name}`` 语义：请求中的版本逐个合并
+      （同版本覆盖依赖），目标包未列出的其他版本与其他包一律保留；
+    * ``versions`` / ``name`` 复用 PUT 的包版本校验，``manifest`` 复用
+      ``POST /api/v1/audits`` 的清单校验；路径包名与请求体 name 不一致、
+      非法 SemVer/范围、根插件在**两侧任一**注册表中不存在，均返回 ``422``；
+    * 分别在当前注册表与内存预演注册表上运行求解器，返回两侧 ``status``、
+      可行时的 ``resolution``，以及 ``changes``（状态是否变化、选中版本的
+      added/removed/changed/unchanged、目标包新增/被覆盖的版本）；
+    * 任一侧搜索预算耗尽（``inconclusive``）时保留 inconclusive，
+      ``status_changed`` 与版本解差异置为 ``null``，不推断任何变化结论。
+    """
+    if name != payload.name:
+        raise HTTPException(status_code=422, detail="路径包名与请求体 name 不一致")
+
+    conn = get_conn(request)
+    registry = load_registry(conn)
+    requested_versions = [v.version for v in payload.versions]
+    preview = build_preview_registry(
+        registry,
+        name,
+        [{"version": v.version, "dependencies": v.dependencies} for v in payload.versions],
+    )
+
+    try:
+        current_result, _, _ = _solve_manifest(payload.manifest, registry)
+        preview_result, _, _ = _solve_manifest(payload.manifest, preview)
+    except (_RootPluginNotFound, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    body = build_preview_body(
+        name,
+        requested_versions,
+        current_result,
+        preview_result,
+        registry,
+        preview,
+    )
+    return RegistryPreviewResponse(**body)
 
 
 @app.get("/api/v1/registry/packages", response_model=dict, tags=["registry"])

@@ -11,6 +11,8 @@
   可轮询作业状态/计数/逐项结果，可取消尚未开始的条目，服务重启后依据 SQLite 状态自动恢复；
 - 提供**只读注册表循环依赖诊断**：把每个已登记包版本按其依赖范围连线构图，
   用强连通分量找出循环（含自依赖），返回涉及的包版本与依赖边，不写入审计或注册表；
+- 提供**注册表变更预演**：写入前在内存构造预演注册表，同一份清单分别在当前与预演
+  注册表求解，对比两侧状态、可行版本解与目标包版本变化，不写入注册表或审计；
 - 自带健康检查、OpenAPI 文档、示例注册表与一键 Docker Compose 启动。
 
 ## 一条命令启动
@@ -610,6 +612,120 @@ curl -s http://localhost:8000/api/v1/registry/cycles | jq
   （数值序，如 `1.2.0` < `1.10.0`）升序，重复调用输出字节一致；
 - 仅 `GET`（其他方法返回 `405`），始终 `200`，无任何参数；空注册表也返回空列表。
 
+### 10. 注册表变更预演（写入前对比，只读）
+
+真正执行 `PUT /api/v1/registry/packages/{name}` 之前，可以先用预演接口在
+**内存**中构造写入后的注册表快照：同一份插件清单分别在**当前注册表**与
+**预演注册表**上求解，返回两侧状态、可行时选中的版本，以及状态与选中版本的变化。
+预演**不写入注册表，也不产生任何审计记录**，可重复调用。
+
+请求体在 PUT 的 `name` / `versions` 之外多带一个 `manifest`
+（格式与 `POST /api/v1/audits` 完全一致），写入语义与 PUT 相同：
+请求中列出的版本逐个合并（同版本覆盖依赖），目标包**未列出的其他版本与其他包一律保留**。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/registry/packages/loggerkit/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "loggerkit",
+    "versions": [
+      {"version": "0.9.0", "dependencies": {"core-lib": "^1.0.0"}}
+    ],
+    "manifest": {
+      "dependencies": [
+        {"name": "cachekit", "range": "^1.0.0"},
+        {"name": "loggerkit", "range": "^0.9.0"}
+      ]
+    }
+  }' | jq
+```
+
+上面的例子里，当前注册表中 `cachekit ^1.0.0` 与 `loggerkit ^0.9.0` 对
+`core-lib` 的要求互相冲突（无解）；预演把 `loggerkit@0.9.0` 的依赖从
+`^2.0.0` 改写成 `^1.0.0` 后变为可行，返回：
+
+```json
+{
+  "name": "loggerkit",
+  "versions": ["0.9.0"],
+  "current": {
+    "status": "infeasible",
+    "resolution": null
+  },
+  "preview": {
+    "status": "feasible",
+    "resolution": {
+      "cachekit": "1.3.0",
+      "core-lib": "1.5.0",
+      "loggerkit": "0.9.0"
+    }
+  },
+  "changes": {
+    "status_changed": true,
+    "resolution": {
+      "added": {
+        "cachekit": "1.3.0",
+        "core-lib": "1.5.0",
+        "loggerkit": "0.9.0"
+      },
+      "removed": {},
+      "changed": {},
+      "unchanged": {}
+    },
+    "package_versions": [
+      {
+        "version": "0.9.0",
+        "before": {"core-lib": "^2.0.0"},
+        "after": {"core-lib": "^1.0.0"}
+      }
+    ]
+  }
+}
+```
+
+两侧**均可行**时，`added` / `removed` 为空，只按选中版本是否移动落到
+`changed` / `unchanged`；一侧 infeasible 时，另一侧解中的包整体计入
+`added`（infeasible → feasible）或 `removed`（feasible → infeasible）。
+例如预演新增 `httpkit@4.0.0`（依赖 `loggerkit ^0.9.0`）、清单要求
+`httpkit *` 时，解从 `httpkit 3.0.0` 上移：
+
+```json
+{
+  "changes": {
+    "status_changed": false,
+    "resolution": {
+      "added": {},
+      "removed": {},
+      "changed": {"httpkit": "4.0.0"},
+      "unchanged": {"core-lib": "2.1.0", "loggerkit": "0.9.0"}
+    },
+    "package_versions": [
+      {"version": "4.0.0", "before": null, "after": {"loggerkit": "^0.9.0"}}
+    ]
+  }
+}
+```
+
+要点：
+
+- **逐版本覆盖、其余保留**：只有请求列出的版本在预演中新增或被覆盖；
+  目标包其他版本与其他包完全不变（例如只预演新版本，旧范围仍可选中旧版本）；
+- `current` / `preview` 各自给出 `status` 与可行时的 `resolution`；
+- `changes.status_changed` 表示求解状态是否变化；只要两侧都是确定结论
+  （非 inconclusive），`changes.resolution` 就给出选中版本的
+  `added` / `removed` / `changed` / `unchanged` 分区
+  （infeasible 一侧没有版本解）；
+- `changes.package_versions` 列出目标包在预演中**新增**（`before: null`）
+  或**依赖被覆盖**的版本（按 SemVer 升序）；依赖未变化的已存在版本不列出；
+- **搜索预算耗尽**：任一侧求解器超过节点预算（默认 20000）时该侧保留
+  `inconclusive`，此时 `status_changed` 与 `resolution` 均为 `null`，
+  不推断任何变化结论（包版本层面的确定性变化仍照常给出）；
+- **校验复用**：`name` / `versions` 复用 PUT 的包版本校验，`manifest`
+  复用审计接口的清单校验；路径包名与请求体 `name` 不一致、非法 SemVer/范围、
+  根插件在两侧任一注册表中不存在，均返回 `422`；
+- **只读**：不修改注册表（随后的 `GET /api/v1/registry/packages` 结果不变），
+  也不写审计记录或异步作业。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -629,6 +745,7 @@ curl -s http://localhost:8000/api/v1/registry/cycles | jq
 | `GET`  | `/api/v1/registry/cycles` | 只读循环依赖诊断：包版本按依赖范围连线构图，返回含环强连通分量（含自依赖）的节点与边；无循环返回空列表 |
 | `GET`  | `/api/v1/registry/packages` | 查看注册表全部包与版本 |
 | `PUT`  | `/api/v1/registry/packages/{name}` | 新增/覆盖一个包及其版本依赖 |
+| `POST` | `/api/v1/registry/packages/{name}/preview` | 注册表变更预演：内存构造写入后的注册表，对比同一份清单在当前/预演两侧的状态与版本解（只读，不写注册表或审计）；非法输入返回 `422` |
 
 ### 清单格式
 
@@ -685,6 +802,8 @@ pytest -q
 时间格式与区间非法返回 422、不被 /{id} 路由遮蔽），
 注册表循环依赖诊断（空注册表/有向无环图返回空列表、自依赖自环按范围是否满足报告、
 多包环的节点与分量内边、范围一对多展开、SemVer 数值序稳定排序、只读不产生审计/注册表写入），
+注册表变更预演（逐版本覆盖/其他版本保留的内存快照、两侧状态与版本解对比、
+新增/覆盖版本差异、搜索预算耗尽保留 inconclusive 且不推断变化、非法输入 422、只读不落库），
 以及导出包的确定性、重复/未知 ID 错误码与逐字节/顺序篡改识别。
 
 ## 项目结构
@@ -701,6 +820,7 @@ app/
   models.py     # Pydantic 请求/响应模型
   impact.py     # 历史影响反查：resolution/sources/conflicts 扫描与层级计算
   cycles.py     # 只读注册表循环依赖诊断：按依赖范围构图 + Tarjan 强连通分量（纯内存）
+  preview.py    # 注册表变更预演：内存构造写入快照、双注册表求解对比与变化分区（纯内存）
   bundle.py     # 可验证 JSONL 导出包的确定性构造与校验（sha256/gzip，纯内存）
 data/
   seed_registry.json   # 示例注册表
